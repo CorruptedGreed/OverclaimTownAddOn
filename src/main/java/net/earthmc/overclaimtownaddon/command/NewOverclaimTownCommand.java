@@ -1,173 +1,287 @@
 package net.earthmc.overclaimtownaddon.command;
 
-import com.palmergames.bukkit.towny.TownyAPI;
-import com.palmergames.bukkit.towny.TownyMessaging;
-import com.palmergames.bukkit.towny.TownySettings;
-import com.palmergames.bukkit.towny.TownyUniverse;
+import com.palmergames.bukkit.towny.*;
+import com.palmergames.bukkit.towny.command.BaseCommand;
 import com.palmergames.bukkit.towny.confirmations.Confirmation;
 import com.palmergames.bukkit.towny.confirmations.ConfirmationTransaction;
+import com.palmergames.bukkit.towny.event.NewTownEvent;
 import com.palmergames.bukkit.towny.event.PreNewTownEvent;
-import com.palmergames.bukkit.towny.exceptions.CancelledEventException;
+import com.palmergames.bukkit.towny.event.TownPreClaimEvent;
 import com.palmergames.bukkit.towny.exceptions.TownyException;
 import com.palmergames.bukkit.towny.object.*;
+import com.palmergames.bukkit.towny.permissions.PermissionNodes;
+import com.palmergames.bukkit.towny.regen.PlotBlockData;
+import com.palmergames.bukkit.towny.regen.TownyRegenAPI;
 import com.palmergames.bukkit.towny.tasks.CooldownTimerTask;
+import com.palmergames.bukkit.towny.utils.MapUtil;
+import com.palmergames.bukkit.towny.utils.NameUtil;
 import com.palmergames.bukkit.util.BukkitTools;
 import com.palmergames.bukkit.util.NameValidation;
 import com.palmergames.util.StringMgmt;
-import org.bukkit.ChatColor;
 import org.bukkit.Location;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.VisibleForTesting;
 
+import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.logging.Level;
 
-import static com.palmergames.bukkit.towny.command.BaseCommand.prettyMoney;
-import static com.palmergames.bukkit.towny.command.TownCommand.newTown;
+import static com.palmergames.bukkit.towny.utils.PlayerCacheUtil.getCache;
 
-public class NewOverclaimTownCommand implements CommandExecutor {
+public class NewOverclaimTownCommand extends BaseCommand implements CommandExecutor {
+
+    private static Towny plugin;
+
+    @VisibleForTesting
+    public static final List<String> townTabCompletes = List.of(
+            "newoverclaim"
+    );
+
+    public static void setPlugin(Towny plugin) {
+        NewOverclaimTownCommand.plugin = plugin;
+    }
+
     @Override
-    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
-        if (!(sender instanceof Player)) {
-            sender.sendMessage(ChatColor.RED + "Only players can run this command.");
-            return false;
+    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command cmd, @NotNull String label, String[] args) {
+        if (sender instanceof Player player) {
+            try {
+                parseTownNewOverclaimCommand(player, args);
+            } catch (TownyException te) {
+                TownyMessaging.sendErrorMsg(player, te.getMessage(player));
+            } catch (Exception e) {
+                TownyMessaging.sendErrorMsg(player, e.getMessage());
+            }
         }
+        return true;
+    }
 
-        Player player = (Player) sender;
-        Resident resident = TownyAPI.getInstance().getResident(player);
-
-        if (args.length != 1) {
-            sender.sendMessage(ChatColor.RED + "Usage: /t newoverclaim <townName>");
-            return false;
+    private void parseTownNewOverclaimCommand(final Player player, String[] split) throws TownyException {
+        System.out.println(Arrays.toString(split));
+        checkPermOrThrow(player, PermissionNodes.TOWNY_COMMAND_TOWN_NEW.getNode());
+        if (split.length < 1) {
+            throw new TownyException(Translatable.of("msg_specify_name"));
+        } else {
+            String townName = split[0]; // Accessing the first (and only) word as the town name
+            boolean noCharge = TownySettings.getNewTownPrice() == 0.0 || !TownyEconomyHandler.isActive();
+            newOverclaimTown(player, townName, getResidentOrThrow(player), noCharge);
         }
+    }
 
-        String name = args[0];
+    /**
+     * Create a new town. Command: /town new [town]
+     *
+     * @param player - Player.
+     * @param name - name of town
+     * @param resident - The resident in charge of the town.
+     * @param noCharge - charging for creation - /ta town new NAME MAYOR has no charge.
+     * @throws TownyException when a new town isn't allowed.
+     */
+    public static void newOverclaimTown(Player player, String name, Resident resident, boolean noCharge) throws TownyException {
+        newOverclaimTown(player, name, resident, noCharge, false);
+    }
 
-        if (TownySettings.hasTownLimit() && TownyUniverse.getInstance().getTowns().size() >= TownySettings.getTownLimit()) {
-            sender.sendMessage(ChatColor.RED + Translatable.of("msg_err_universe_limit").toString());
-            return false;
-        }
+    /**
+     * Create a new town. Command: /town new [townname] or /ta town new [townname]
+     *
+     * @param player Player using the command.
+     * @param name Name of town
+     * @param resident The resident in charge of the town.
+     * @param noCharge Charging for creation - /ta town new NAME MAYOR has no charge.
+     * @param adminCreated true when an admin has used /ta town new [NAME].
+     * @throws TownyException when a new town isn't allowed.
+     */
+    public static void newOverclaimTown(Player player, String name, Resident resident, boolean noCharge, boolean adminCreated) throws TownyException {
+        if (!TownySettings.isOverClaimingAllowingStolenLand())
+            throw new TownyException(Translatable.of("msg_err_taking_over_claims_is_not_enabled"));
+
+        if (TownySettings.hasTownLimit() && TownyUniverse.getInstance().getTowns().size() >= TownySettings.getTownLimit())
+            throw new TownyException(Translatable.of("msg_err_universe_limit"));
 
         // Check if the player has a cooldown since deleting their town.
-        if (!resident.isAdmin() && CooldownTimerTask.hasCooldown(player.getName(), CooldownTimerTask.CooldownType.TOWN_DELETE)) {
-            sender.sendMessage(ChatColor.RED + Translatable.of("msg_err_cannot_create_new_town_x_seconds_remaining",
-                    CooldownTimerTask.getCooldownRemaining(player.getName(), CooldownTimerTask.CooldownType.TOWN_DELETE)).toString());
-            return false;
-        }
+        if (!resident.isAdmin() && CooldownTimerTask.hasCooldown(player.getName(), CooldownTimerTask.CooldownType.TOWN_DELETE))
+            throw new TownyException(Translatable.of("msg_err_cannot_create_new_town_x_seconds_remaining",
+                    CooldownTimerTask.getCooldownRemaining(player.getName(), CooldownTimerTask.CooldownType.TOWN_DELETE)));
 
         if (TownySettings.getTownAutomaticCapitalisationEnabled())
             name = StringMgmt.capitalizeStrings(name);
 
-        try {
-            name = NameValidation.checkAndFilterTownNameOrThrow(name);
-        } catch (TownyException e) {
-            sender.sendMessage(ChatColor.RED + e.getMessage());
-            return false;
-        }
+        name = NameValidation.checkAndFilterTownNameOrThrow(name);
+        if (TownyUniverse.getInstance().hasTown(name))
+            throw new TownyException(Translatable.of("msg_err_name_validation_name_already_in_use", name));
 
-        if (TownyUniverse.getInstance().hasTown(name)) {
-            sender.sendMessage(ChatColor.RED + Translatable.of("msg_err_name_validation_name_already_in_use", name).toString());
-            return false;
-        }
-
-        if (resident.hasTown()) {
-            sender.sendMessage(ChatColor.RED + Translatable.of("msg_err_already_res", resident.getName()).toString());
-            return false;
-        }
+        if (resident.hasTown())
+            throw new TownyException(Translatable.of("msg_err_already_res", resident.getName()));
 
         final TownyWorld world = TownyAPI.getInstance().getTownyWorld(player.getWorld());
 
-        if (world == null || !world.isUsingTowny()) {
-            sender.sendMessage(ChatColor.RED + Translatable.of("msg_set_use_towny_off").toString());
-            return false;
-        }
-
-        if (!world.isClaimable()) {
-            sender.sendMessage(ChatColor.RED + Translatable.of("msg_not_claimable").toString());
-            return false;
-        }
+        if (world == null || !world.isUsingTowny())
+            throw new TownyException(Translatable.of("msg_set_use_towny_off"));
 
         Location spawnLocation = player.getLocation();
         Coord key = Coord.parseCoord(player);
+
+        if (TownyAPI.getInstance().isWilderness(spawnLocation))
+            throw new TownyException("Use the /t new command to found a new town in wilderness!");
+
         WorldCoord wc = WorldCoord.parseWorldCoord(player);
 
-        if (TownyAPI.getInstance().isWilderness(spawnLocation)) {
-            sender.sendMessage(ChatColor.RED + Translatable.of("msg_already_claimed_1", key).toString());
-            return false;
-        }
+        // Make sure this is in a town which is overclaimed, allowing for stealing land.
+        if (!wc.canBeStolen())
+            throw new TownyException(Translatable.of("msg_err_this_townblock_cannot_be_taken_over"));
 
-        if (newTownWouldBeFoundedOnBorder(WorldCoord.parseWorldCoord(spawnLocation))) {
-            sender.sendMessage(ChatColor.RED + Translatable.of("msg_err_you_cannot_over_claim_would_cut_into_two").toString());
-            return false;
-        }
+        if (!newTownWouldBeFoundedOnBorder(WorldCoord.parseWorldCoord(spawnLocation)))
+            throw new TownyException("A town cannot be founded here due to not being on the border of the existing overclaimable town!");
 
-        // If all checks passed, continue with the command execution
+        // If the town doesn't cost money to create, just make the Town.
+        if (noCharge || !TownyEconomyHandler.isActive()) {
+            BukkitTools.ifCancelledThenThrow(new PreNewTownEvent(player, name, spawnLocation, 0));
+            newTown(world, name, resident, key, spawnLocation, player);
+            TownyMessaging.sendGlobalMessage(Translatable.of("msg_new_town", player.getName(), StringMgmt.remUnderscore(name)));
+            return;
+        }
 
         // Fire a cancellable event that allows plugins to alter the price of a town.
         PreNewTownEvent pnte = new PreNewTownEvent(player, name, spawnLocation, TownySettings.getNewTownPrice());
-        try {
-            BukkitTools.ifCancelledThenThrow(pnte);
-        } catch (CancelledEventException e) {
-            throw new RuntimeException(e);
-        }
+        BukkitTools.ifCancelledThenThrow(pnte);
 
         // Test if the resident can afford the town.
         double cost = pnte.getPrice();
-        if(!resident.getAccount().
-
-                canPayFromHoldings(cost))
-            try {
-                throw new
-
-                        TownyException(Translatable.of("msg_no_funds_new_town2", (resident.getName().
-
-                        equals(player.getName())?Translatable.of("msg_you"):resident.getName()),cost));
-            } catch (TownyException e) {
-                throw new RuntimeException(e);
-            }
+        if (!resident.getAccount().canPayFromHoldings(cost))
+            throw new TownyException(Translatable.of("msg_no_funds_new_town2", (resident.getName().equals(player.getName()) ? Translatable.of("msg_you") : resident.getName()), cost));
 
         // Send a confirmation before taking their money and throwing the PreNewTownEvent.
-        final String finalName = name; // TODO: The confirmation runs twice, only actually making the town on the 2nd one
-        Confirmation.runOnAccept(()-> { // TODO: On confirmation accepted, remove existing town block before creating new town
+        final String finalName = name;
+        Confirmation.runOnAccept(() -> {
                     try {
                         // Make town.
-                        newTown(player, finalName, resident, false); // TODO: Make sure this works with/without world
+                        newTown(world, finalName, resident, key, spawnLocation, player);
+
+                        // Get townblock and town.
+                        TownBlock townblock = Objects.requireNonNull(TownyAPI.getInstance().getTown(player.getLocation())).getTownBlock(wc);
+                        Town town = TownyAPI.getInstance().getTown(player);
+
+                        // This should never happen.
+                        if (town == null)
+                            throw new TownyException(String.format("Error fetching new town from name '%s'", finalName));
+
+                        // Assign townblock to new town and set it as homeblock.
+                        townblock.setTown(town);
+                        town.setHomeBlock(townblock);
+
+                        resident.save();
+                        townblock.save();
+                        town.save();
+                        world.save();
+
                         TownyMessaging.sendGlobalMessage(Translatable.of("msg_new_town", player.getName(), StringMgmt.remUnderscore(finalName)));
                     } catch (TownyException e) {
                         TownyMessaging.sendErrorMsg(player, e.getMessage(player));
+                        plugin.getLogger().log(Level.WARNING, "An exception occurred while creating a new town", e);
                     }
                 })
                 .setTitle(Translatable.of("msg_confirm_purchase", prettyMoney(cost)))
-                .setCost(new ConfirmationTransaction(() ->cost,resident,"New Town Cost",
-                        Translatable.of("msg_no_funds_new_town2",(resident.getName().equals(player.getName())?Translatable.of("msg_you"):resident.getName()), prettyMoney(cost))))
+                .setCost(new ConfirmationTransaction(() -> cost, resident, "New Town Cost",
+                        Translatable.of("msg_no_funds_new_town2", (resident.getName().equals(player.getName()) ? Translatable.of("msg_you") : resident.getName()), prettyMoney(cost))))
                 .sendTo(player);
-        return true;
     }
 
-    private static boolean newTownWouldBeFoundedOnBorder(WorldCoord worldCoord) { // TODO: Remove print debugs
+    private static boolean newTownWouldBeFoundedOnBorder(WorldCoord worldCoord) {
         Town currentTown = worldCoord.getTownOrNull();
         List<WorldCoord> surroundingClaims = worldCoord.getCardinallyAdjacentWorldCoords(true);
-
-        // Log the list of surrounding claims
-        System.out.println("Surrounding Claims: " + surroundingClaims);
 
         // Check if all four cardinal chunks belong to the same town
         long sameTownChunks = surroundingClaims.stream().filter(wc -> {
             // Log each individual chunk being checked by the stream
-            System.out.println("Checking chunk: " + wc);
             return wc.hasTown(currentTown);
         }).count();
 
         // Log the final conclusion on true or false
         if (sameTownChunks == 8) {
-            System.out.println("Final Conclusion: true");
-            return true;
-        } else {
-            System.out.println("Final Conclusion: false");
             return false;
+        } else {
+            return true;
         }
     }
+
+    public static Town newTown(TownyWorld world, String name, Resident resident, Coord key, Location spawn, Player player) throws TownyException {
+
+        TownyUniverse.getInstance().newTown(name);
+        Town town = TownyUniverse.getInstance().getTown(name);
+
+        // This should never happen
+        if (town == null)
+            throw new TownyException(String.format("Error fetching new town from name '%s'", name));
+
+        TownBlock townBlock = new TownBlock(key.getX(), key.getZ(), world);
+        townBlock.setTown(town);
+        TownPreClaimEvent preClaimEvent = new TownPreClaimEvent(town, townBlock, player, false, true, false);
+        preClaimEvent.setCancelMessage(Translation.of("msg_claim_error", 1, 1));
+
+        if (BukkitTools.isEventCancelled(preClaimEvent)) {
+            TownyUniverse.getInstance().removeTownBlock(townBlock);
+            TownyUniverse.getInstance().unregisterTown(town);
+            town = null;
+            townBlock = null;
+            throw new TownyException(preClaimEvent.getCancelMessage());
+        }
+
+        town.setRegistered(System.currentTimeMillis());
+        town.setMapColorHexCode(MapUtil.generateRandomTownColourAsHexCode());
+        resident.setTown(town);
+        town.setMayor(resident, false);
+        town.setFounder(resident.getName());
+
+        // Set the plot permissions to mirror the towns.
+        townBlock.setType(townBlock.getType());
+        town.setSpawn(spawn);
+
+        // Disable upkeep if the mayor is an npc
+        if (resident.isNPC())
+            town.setHasUpkeep(false);
+
+        if (world.isUsingPlotManagementRevert()) {
+            PlotBlockData plotChunk = TownyRegenAPI.getPlotChunk(townBlock);
+            if (plotChunk != null && TownyRegenAPI.getRegenQueueList().contains(townBlock.getWorldCoord())) {
+                // This plot is in the regeneration queue.
+                TownyRegenAPI.removeFromActiveRegeneration(plotChunk); // just claimed so stop regeneration.
+                TownyRegenAPI.removeFromRegenQueueList(townBlock.getWorldCoord()); // Remove the WorldCoord from the regenqueue.
+                TownyRegenAPI.addPlotChunkSnapshot(plotChunk); // Save a snapshot.
+            } else {
+                TownyRegenAPI.handleNewSnapshot(townBlock);
+            }
+        }
+
+        if (TownyEconomyHandler.isActive()) {
+            TownyMessaging.sendDebugMsg("Creating new Town account: " + TownySettings.getTownAccountPrefix() + name);
+            try {
+                town.getAccount().setBalance(0, "Setting 0 balance for Town");
+            } catch (NullPointerException e1) {
+                throw new TownyException("The server economy plugin " + TownyEconomyHandler.getVersion() + " could not return the Town account!");
+            }
+        }
+
+        if (TownySettings.isTownTagSetAutomatically())
+            town.setTag(NameUtil.getTagFromName(name));
+
+        resident.save();
+        townBlock.save();
+        town.save();
+        world.save();
+
+        // Reset cache permissions for anyone in this TownBlock
+        for (Player players : BukkitTools.getOnlinePlayers())
+            if (players != null)
+                if (WorldCoord.parseWorldCoord(players).equals(townBlock.getWorldCoord()))
+                    getCache(players).resetAndUpdate(townBlock.getWorldCoord()); // Automatically resets permissions.
+
+        BukkitTools.fireEvent(new NewTownEvent(town));
+
+        return town;
+    }
 }
+

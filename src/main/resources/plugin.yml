@@ -2,4 +2,6 @@ name: OverclaimTownAddOn
 version: '${project.version}'
 main: net.earthmc.overclaimtownaddon.OverclaimTownAddOn
 api-version: '1.19'
+authors: [CorruptedGreed]
 depend: [ Towny ]
+folia-supported: true
